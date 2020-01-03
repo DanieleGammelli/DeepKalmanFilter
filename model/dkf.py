@@ -7,19 +7,20 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 import torch
 import torch.nn as nn
-from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
-from sklearn.preprocessing import StandardScaler
 
 import pyro
 import pyro.distributions as dist
 import pyro.poutine as poutine
 from pyro.distributions import TransformedDistribution
-from pyro.infer import SVI, Trace_ELBO
+from pyro.infer import SVI, JitTrace_ELBO, Trace_ELBO, TracePredictive, EmpiricalMarginal
+from pyro.nn import AutoRegressiveNN
 from pyro.optim import ClippedAdam
+from pyro.infer.autoguide import AutoDelta, AutoDiagonalNormal
+
 
 class Emitter(nn.Module):
     """
-    Parameterizes the bernoulli observation likelihood `p(x_t | z_t)`
+    Parameterizes the gaussian observation likelihood `p(x_t | z_t)`
     """
 
     def __init__(self, input_dim, z_dim, emission_dim):
@@ -34,7 +35,7 @@ class Emitter(nn.Module):
     def forward(self, z_t):
         """
         Given the latent z at a particular time step t we return the vector of
-        means `mu` that parameterizes the gaussian distribution `p(x_t|z_t)`
+        means that parameterizes the gaussian distribution `p(x_t|z_t)`
         """
         h1 = self.relu(self.lin_z_to_hidden(z_t))
         h2 = self.relu(self.lin_hidden_to_hidden(h1))
@@ -63,6 +64,7 @@ class GatedTransition(nn.Module):
         # initialize the three non-linearities used in the neural network
         self.relu = nn.ReLU()
         self.softplus = nn.Softplus()
+        #self.batchnorm = nn.BatchNorm1d(num_features=transition_dim)
 
     def forward(self, z_t_1):
         """
@@ -72,6 +74,7 @@ class GatedTransition(nn.Module):
         """
         # compute the gating function
         _gate = self.relu(self.lin_gate_z_to_hidden(z_t_1))
+#         _gate = self.batchnorm(_gate)
         gate = torch.sigmoid(self.lin_gate_hidden_to_z(_gate))
         # compute the 'proposed mean'
         _proposed_mean = self.relu(self.lin_proposed_mean_z_to_hidden(z_t_1))
@@ -88,7 +91,7 @@ class GatedTransition(nn.Module):
 class Combiner(nn.Module):
     """
     Parameterizes `q(z_t | z_{t-1}, x_{t:T})`, which is the basic building block
-    of the guide (i.e. the variational distribution). The dependence on `x_{t:T}` is
+    of the guide (i.e. the variational distribution). The dependence on `x_{:t}` is
     through the hidden state of the RNN (see the PyTorch module `rnn` below)
     """
 
@@ -105,8 +108,8 @@ class Combiner(nn.Module):
     def forward(self, z_t_1, h_rnn):
         """
         Given the latent z at at a particular time step t-1 as well as the hidden
-        state of the RNN `h(x_{t:T})` we return the mean and scale vectors that
-        parameterize the (diagonal) gaussian distribution `q(z_t | z_{t-1}, x_{t:T})`
+        state of the RNN `h(x_{:t})` we return the mean and scale vectors that
+        parameterize the (diagonal) gaussian distribution `q(z_t | z_{t-1}, x_{:t})`
         """
         # combine the rnn hidden state with a transformed version of z_t_1
         h_combined = 0.5 * (self.tanh(self.lin_z_to_hidden(z_t_1)) + h_rnn)
@@ -117,7 +120,7 @@ class Combiner(nn.Module):
         # return loc, scale which can be fed into Normal
         return loc, scale
     
-class DMM(nn.Module):
+class DKF(nn.Module):
     """
     This PyTorch Module encapsulates the model as well as the
     variational distribution (the guide) for the Deep Kalman Filter
@@ -125,11 +128,12 @@ class DMM(nn.Module):
 
     def __init__(self, input_dim=1, z_dim=10, emission_dim=30,
                  transition_dim=30, rnn_dim=10, num_layers=1, use_cuda=False, annealing_factor=1.):
-        super(DMM, self).__init__()
+        super(DKF, self).__init__()
         # instantiate PyTorch modules used in the model and guide below
         self.emitter = Emitter(input_dim, z_dim, emission_dim)
         self.trans = GatedTransition(z_dim, transition_dim)
         self.combiner = Combiner(z_dim, rnn_dim)
+        # TODO manually define pytorch module
         self.rnn = nn.RNN(input_size=input_dim, hidden_size=rnn_dim, nonlinearity="relu",
                          batch_first=True, bidirectional=False, num_layers=num_layers)
         # define a (trainable) parameters z_0 and z_q_0 that help define the probability
@@ -156,27 +160,21 @@ class DMM(nn.Module):
         
         # register all PyTorch (sub)modules with pyro
         # this needs to happen in both the model and guide
-        pyro.module("dmm", self)
+        pyro.module("dkf", self)
 
         # set z_prev = z_0 to setup the recursive conditioning in p(z_t | z_{t-1})
         z_prev = self.z_0.expand(batch_size, self.z_0.size(0))
         # we enclose all the sample statements in the model in a plate.
         # this marks that each datapoint is conditionally independent of the others
         with pyro.plate("data", batch_size):
-            mus = torch.zeros((batch_size, T_max, sequence.size(2)))
-            sigmas = torch.zeros((batch_size, T_max, sequence.size(2)))
+            mus = torch.zeros((batch_size, T_max, 1))
+            sigmas = torch.zeros((batch_size, T_max, 1))
             # sample the latents z and observed x's one time step at a time
             for t in range(1, T_max + 1):
-                # the next chunk of code samples z_t ~ p(z_t | z_{t-1})
-                # note that (both here and elsewhere) we use poutine.scale to take care
-                # of KL annealing.
-
                 # first compute the parameters of the diagonal gaussian distribution p(z_t | z_{t-1})
                 z_loc, z_scale = self.trans(z_prev)
                 
                 # then sample z_t according to dist.Normal(z_loc, z_scale)
-                # note that we use the reshape method so that the univariate Normal distribution
-                # is treated as a multivariate Normal distribution with a diagonal covariance.
                 with poutine.scale(scale=self.annealing_factor):
                     z_t = pyro.sample("z_%d" % t, dist.Normal(z_loc, z_scale).to_event(1))
                 # compute the probabilities that parameterize the bernoulli likelihood
@@ -201,13 +199,14 @@ class DMM(nn.Module):
         # this is the number of time steps we need to process in the mini-batch
         T_max = len(sequence[0]) if isinstance(sequence, list) else sequence.size(1)
         # register all PyTorch (sub)modules with pyro
-        pyro.module("dmm", self)
+        pyro.module("dkf", self)
         # if on gpu we need the fully broadcast view of the rnn initial state
         # to be in contiguous gpu memory
         h_0_contig = self.h_0.expand(1, batch_size, self.rnn.hidden_size).contiguous()
         # push the observed x's through the rnn;
         # rnn_output contains the hidden state at each time step
         rnn_output, rnn_hidden_state = self.rnn(sequence, h_0_contig)
+        
     
         # set z_prev = z_q_0 to setup the recursive conditioning in q(z_t |...)
         z_prev = self.z_q_0.expand(batch_size, self.z_q_0.size(0))
@@ -217,7 +216,7 @@ class DMM(nn.Module):
         with pyro.plate("data", batch_size):
             # sample the latents z one time step at a time
             for t in range(1, T_max + 1):
-                # the next two lines assemble the distribution q(z_t | z_{t-1}, x_{t:T})
+                # the next two lines assemble the distribution q(z_t | z_{t-1}, x_{:t})
                 z_loc, z_scale = self.combiner(z_prev, rnn_output[:, t - 1, :])
                 
                 z_dist = dist.Normal(z_loc, z_scale)
